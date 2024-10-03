@@ -81,14 +81,14 @@ fn main() -> Result<()> {
             Ok(())
         }
         ForgeSubcommand::Clean { root } => {
-            let config = utils::load_config_with_root(root);
+            let config = utils::load_config_with_root(root.as_deref());
             let project = config.project()?;
             config.cleanup(&project)?;
             Ok(())
         }
         ForgeSubcommand::Snapshot(cmd) => {
             if cmd.is_watch() {
-                utils::block_on(watch::watch_snapshot(cmd))
+                utils::block_on(watch::watch_gas_snapshot(cmd))
             } else {
                 utils::block_on(cmd.run())
             }

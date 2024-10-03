@@ -5,7 +5,10 @@ use alloy_primitives::{b256, B256};
 use anvil::{EthereumHardfork, NodeConfig};
 use foundry_test_utils::{
     casttest, file,
-    rpc::{next_http_rpc_endpoint, next_rpc_endpoint, next_ws_rpc_endpoint},
+    rpc::{
+        next_http_rpc_endpoint, next_mainnet_etherscan_api_key, next_rpc_endpoint,
+        next_ws_rpc_endpoint,
+    },
     str,
     util::OutputExt,
 };
@@ -51,6 +54,7 @@ mixHash              [..]
 nonce                [..]
 number               [..]
 parentHash           [..]
+parentBeaconRoot     [..]
 transactionsRoot     [..]
 receiptsRoot         [..]
 sha3Uncles           [..]
@@ -699,6 +703,8 @@ to                      0x91da5bf3F8Eb72724E6f50Ec6C3D199C6355c59c
 
 "#]]);
 
+    let rpc = next_http_rpc_endpoint();
+
     // <https://etherscan.io/tx/0x0e07d8b53ed3d91314c80e53cf25bcde02084939395845cbb625b029d568135c>
     cmd.cast_fuse()
         .args([
@@ -876,6 +882,8 @@ casttest!(mktx_requires_to, |_prj, cmd| {
         "mktx",
         "--private-key",
         "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "--chain",
+        "1",
     ]);
     cmd.assert_failure().stderr_eq(str![[r#"
 Error: 
@@ -964,6 +972,8 @@ casttest!(send_requires_to, |_prj, cmd| {
         "send",
         "--private-key",
         "0x0000000000000000000000000000000000000000000000000000000000000001",
+        "--chain",
+        "1",
     ]);
     cmd.assert_failure().stderr_eq(str![[r#"
 Error: 
@@ -1013,6 +1023,7 @@ casttest!(storage, |_prj, cmd| {
 
 "#]]);
 
+    let rpc = next_http_rpc_endpoint();
     cmd.cast_fuse()
         .args(["storage", usdt, total_supply_slot, "--rpc-url", &rpc, "--block", block_after])
         .assert_success()
@@ -1115,20 +1126,22 @@ casttest!(interface_no_constructor, |prj, cmd| {
     let path = prj.root().join("interface.json");
     fs::write(&path, interface).unwrap();
     // Call `cast find-block`
-    cmd.args(["interface"]).arg(&path).assert_success().stdout_eq(str![[
+    cmd.arg("interface").arg(&path).assert_success().stdout_eq(str![[
         r#"// SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.4;
 
-interface Interface {
+library IIntegrationManager {
     type SpendAssetsHandleType is uint8;
+}
 
+interface Interface {
     function getIntegrationManager() external view returns (address integrationManager_);
     function lend(address _vaultProxy, bytes memory, bytes memory _assetData) external;
     function parseAssetsForAction(address, bytes4 _selector, bytes memory _actionData)
         external
         view
         returns (
-            SpendAssetsHandleType spendAssetsHandleType_,
+            IIntegrationManager.SpendAssetsHandleType spendAssetsHandleType_,
             address[] memory spendAssets_,
             uint256[] memory spendAssetAmounts_,
             address[] memory incomingAssets_,
@@ -1144,11 +1157,15 @@ interface Interface {
 // tests that fetches WETH interface from etherscan
 // <https://etherscan.io/token/0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2>
 casttest!(fetch_weth_interface_from_etherscan, |_prj, cmd| {
-    let weth_address = "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2";
-    let api_key = "ZUB97R31KSYX7NYVW6224Q6EYY6U56H591";
-    cmd.args(["interface", "--etherscan-api-key", api_key, weth_address])
-        .assert_success()
-        .stdout_eq(str![[r#"// SPDX-License-Identifier: UNLICENSED
+    cmd.args([
+        "interface",
+        "--etherscan-api-key",
+        &next_mainnet_etherscan_api_key(),
+        "0xc02aaa39b223fe8d0a0e5c4f27ead9083c756cc2",
+    ])
+    .assert_success()
+    .stdout_eq(str![[r#"
+// SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.4;
 
 interface WETH9 {

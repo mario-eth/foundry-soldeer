@@ -37,6 +37,7 @@ forgetest!(can_extract_config_values, |prj, cmd| {
         libs: vec!["lib-test".into()],
         cache: true,
         cache_path: "test-cache".into(),
+        snapshots: "snapshots".into(),
         broadcast: "broadcast".into(),
         force: true,
         evm_version: EvmVersion::Byzantium,
@@ -195,22 +196,11 @@ forgetest_init!(can_override_config, |prj, cmd| {
     // remappings work
     let remappings_txt =
         prj.create_file("remappings.txt", "ds-test/=lib/forge-std/lib/ds-test/from-file/");
-    let config = forge_utils::load_config_with_root(Some(prj.root().into()));
+    let config = forge_utils::load_config_with_root(Some(prj.root()));
     assert_eq!(
         format!(
             "ds-test/={}/",
             prj.root().join("lib/forge-std/lib/ds-test/from-file").to_slash_lossy()
-        ),
-        Remapping::from(config.remappings[0].clone()).to_string()
-    );
-
-    // env vars work
-    std::env::set_var("DAPP_REMAPPINGS", "ds-test/=lib/forge-std/lib/ds-test/from-env/");
-    let config = forge_utils::load_config_with_root(Some(prj.root().into()));
-    assert_eq!(
-        format!(
-            "ds-test/={}/",
-            prj.root().join("lib/forge-std/lib/ds-test/from-env").to_slash_lossy()
         ),
         Remapping::from(config.remappings[0].clone()).to_string()
     );
@@ -233,7 +223,6 @@ forgetest_init!(can_override_config, |prj, cmd| {
         Remapping::from(config.remappings[0].clone()).to_string()
     );
 
-    std::env::remove_var("DAPP_REMAPPINGS");
     pretty_err(&remappings_txt, fs::remove_file(&remappings_txt));
 
     let expected = profile.into_basic().to_string_pretty().unwrap().trim().to_string();
@@ -283,7 +272,7 @@ Installing solmate in [..] (url: Some("https://github.com/transmissions11/solmat
         "remappings.txt",
         "solmate/=lib/solmate/src/\nsolmate-contracts/=lib/solmate/src/",
     );
-    let config = forge_utils::load_config_with_root(Some(prj.root().into()));
+    let config = forge_utils::load_config_with_root(Some(prj.root()));
     // trailing slashes are removed on windows `to_slash_lossy`
     let path = prj.root().join("lib/solmate/src/").to_slash_lossy().into_owned();
     #[cfg(windows)]
@@ -616,7 +605,7 @@ forgetest!(can_update_libs_section, |prj, cmd| {
     cmd.args(["install", "foundry-rs/forge-std", "--no-commit"]).assert_success().stdout_eq(str![
         [r#"
 Installing forge-std in [..] (url: Some("https://github.com/foundry-rs/forge-std"), tag: None)
-    Installed forge-std [..]
+    Installed forge-std[..]
 
 "#]
     ]);
@@ -648,7 +637,7 @@ forgetest!(config_emit_warnings, |prj, cmd| {
     cmd.args(["install", "foundry-rs/forge-std", "--no-commit"]).assert_success().stdout_eq(str![
         [r#"
 Installing forge-std in [..] (url: Some("https://github.com/foundry-rs/forge-std"), tag: None)
-    Installed forge-std [..]
+    Installed forge-std[..]
 
 "#]
     ]);
@@ -689,7 +678,8 @@ forgetest_init!(can_parse_default_fs_permissions, |_prj, cmd| {
     let config = cmd.config();
 
     assert_eq!(config.fs_permissions.len(), 1);
-    let out_permission = config.fs_permissions.find_permission(Path::new("out")).unwrap();
+    let permissions = config.fs_permissions.joined(Path::new("test"));
+    let out_permission = permissions.find_permission(Path::new("test/out")).unwrap();
     assert_eq!(FsAccessPermission::Read, out_permission);
 });
 

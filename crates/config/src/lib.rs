@@ -38,12 +38,11 @@ use foundry_compilers::{
 };
 use inflector::Inflector;
 use regex::Regex;
-use revm_primitives::{FixedBytes, SpecId};
+use revm_primitives::{map::AddressHashMap, FixedBytes, SpecId};
 use semver::Version;
 use serde::{Deserialize, Serialize, Serializer};
 use std::{
     borrow::Cow,
-    collections::HashMap,
     fs,
     path::{Path, PathBuf},
     str::FromStr,
@@ -176,6 +175,8 @@ pub struct Config {
     pub cache: bool,
     /// where the cache is stored if enabled
     pub cache_path: PathBuf,
+    /// where the gas snapshots are stored
+    pub snapshots: PathBuf,
     /// where the broadcast logs are stored
     pub broadcast: PathBuf,
     /// additional solc allow paths for `--allow-paths`
@@ -212,7 +213,16 @@ pub struct Config {
     pub offline: bool,
     /// Whether to activate optimizer
     pub optimizer: bool,
-    /// Sets the optimizer runs
+    /// The number of runs specifies roughly how often each opcode of the deployed code will be
+    /// executed across the life-time of the contract. This means it is a trade-off parameter
+    /// between code size (deploy cost) and code execution cost (cost after deployment).
+    /// An `optimizer_runs` parameter of `1` will produce short but expensive code. In contrast, a
+    /// larger `optimizer_runs` parameter will produce longer but more gas efficient code. The
+    /// maximum value of the parameter is `2**32-1`.
+    ///
+    /// A common misconception is that this parameter specifies the number of iterations of the
+    /// optimizer. This is not true: The optimizer will always run as many times as it can
+    /// still improve the code.
     pub optimizer_runs: usize,
     /// Switch optimizer components on or off in detail.
     /// The "enabled" switch above provides two defaults which can be
@@ -409,7 +419,7 @@ pub struct Config {
     pub disable_block_gas_limit: bool,
 
     /// Address labels
-    pub labels: HashMap<Address, String>,
+    pub labels: AddressHashMap<String>,
 
     /// Whether to enable safety checks for `vm.getCode` and `vm.getDeployedCode` invocations.
     /// If disabled, it is possible to access artifacts which were not recompiled or cached.
@@ -522,7 +532,7 @@ impl Config {
 
     /// Returns the current `Config`
     ///
-    /// See `Config::figment`
+    /// See [`figment`](Self::figment) for more details.
     #[track_caller]
     pub fn load() -> Self {
         Self::from_provider(Self::figment())
@@ -530,7 +540,7 @@ impl Config {
 
     /// Returns the current `Config` with the given `providers` preset
     ///
-    /// See `Config::to_figment`
+    /// See [`figment`](Self::figment) for more details.
     #[track_caller]
     pub fn load_with_providers(providers: FigmentProviders) -> Self {
         Self::default().to_figment(providers).extract().unwrap()
@@ -538,10 +548,10 @@ impl Config {
 
     /// Returns the current `Config`
     ///
-    /// See `Config::figment_with_root`
+    /// See [`figment_with_root`](Self::figment_with_root) for more details.
     #[track_caller]
-    pub fn load_with_root(root: impl Into<PathBuf>) -> Self {
-        Self::from_provider(Self::figment_with_root(root))
+    pub fn load_with_root(root: impl AsRef<Path>) -> Self {
+        Self::from_provider(Self::figment_with_root(root.as_ref()))
     }
 
     /// Extract a `Config` from `provider`, panicking if extraction fails.
@@ -710,6 +720,7 @@ impl Config {
         self.out = p(&root, &self.out);
         self.broadcast = p(&root, &self.broadcast);
         self.cache_path = p(&root, &self.cache_path);
+        self.snapshots = p(&root, &self.snapshots);
 
         if let Some(build_info_path) = self.build_info_path {
             self.build_info_path = Some(p(&root, &build_info_path));
@@ -876,6 +887,12 @@ impl Config {
         };
         remove_test_dir(&self.fuzz.failure_persist_dir);
         remove_test_dir(&self.invariant.failure_persist_dir);
+
+        // Remove snapshot directory.
+        let snapshot_dir = project.root().join(&self.snapshots);
+        if snapshot_dir.exists() {
+            let _ = fs::remove_dir_all(&snapshot_dir);
+        }
 
         Ok(())
     }
@@ -1407,8 +1424,8 @@ impl Config {
     ///
     /// let my_config = Config::figment_with_root(".").extract::<Config>();
     /// ```
-    pub fn figment_with_root(root: impl Into<PathBuf>) -> Figment {
-        Self::with_root(root).into()
+    pub fn figment_with_root(root: impl AsRef<Path>) -> Figment {
+        Self::with_root(root.as_ref()).into()
     }
 
     /// Creates a new Config that adds additional context extracted from the provided root.
@@ -1419,10 +1436,13 @@ impl Config {
     /// use foundry_config::Config;
     /// let my_config = Config::with_root(".");
     /// ```
-    pub fn with_root(root: impl Into<PathBuf>) -> Self {
+    pub fn with_root(root: impl AsRef<Path>) -> Self {
+        Self::_with_root(root.as_ref())
+    }
+
+    fn _with_root(root: &Path) -> Self {
         // autodetect paths
-        let root = root.into();
-        let paths = ProjectPathsConfig::builder().build_with_root::<()>(&root);
+        let paths = ProjectPathsConfig::builder().build_with_root::<()>(root);
         let artifacts: PathBuf = paths.artifacts.file_name().unwrap().into();
         Self {
             root: paths.root.into(),
@@ -1432,7 +1452,7 @@ impl Config {
             remappings: paths
                 .remappings
                 .into_iter()
-                .map(|r| RelativeRemapping::new(r, &root))
+                .map(|r| RelativeRemapping::new(r, root))
                 .collect(),
             fs_permissions: FsPermissions::new([PathPermission::read(artifacts)]),
             ..Self::default()
@@ -1481,7 +1501,7 @@ impl Config {
     ///
     /// **Note:** the closure will only be invoked if the `foundry.toml` file exists, See
     /// [Self::get_config_path()] and if the closure returns `true`.
-    pub fn update_at<F>(root: impl Into<PathBuf>, f: F) -> eyre::Result<()>
+    pub fn update_at<F>(root: &Path, f: F) -> eyre::Result<()>
     where
         F: FnOnce(&Self, &mut toml_edit::DocumentMut) -> bool,
     {
@@ -2075,6 +2095,7 @@ impl Default for Config {
             cache: true,
             cache_path: "cache".into(),
             broadcast: "broadcast".into(),
+            snapshots: "snapshots".into(),
             allow_paths: vec![],
             include_paths: vec![],
             force: false,
@@ -2705,7 +2726,7 @@ impl<P: Provider> Provider for OptionalStrictProfileProvider<P> {
         figment.data().map_err(|err| {
             // figment does tag metadata and tries to map metadata to an error, since we use a new
             // figment in this provider this new figment does not know about the metadata of the
-            // provider and can't map the metadata to the error. Therefor we return the root error
+            // provider and can't map the metadata to the error. Therefore we return the root error
             // if this error originated in the provider's data.
             if let Err(root_err) = self.provider.data() {
                 return root_err;
@@ -5022,7 +5043,7 @@ mod tests {
             let config = Config::load();
             assert_eq!(
                 config.labels,
-                HashMap::from_iter(vec![
+                AddressHashMap::from_iter(vec![
                     (
                         Address::from_str("0x1F98431c8aD98523631AE4a59f267346ea31F984").unwrap(),
                         "Uniswap V3: Factory".to_string()

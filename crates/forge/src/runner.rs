@@ -164,9 +164,13 @@ impl<'a> ContractRunner<'a> {
                     } = *err;
                     (logs, traces, labels, Some(format!("setup failed: {reason}")), coverage)
                 }
-                Err(err) => {
-                    (Vec::new(), None, HashMap::new(), Some(format!("setup failed: {err}")), None)
-                }
+                Err(err) => (
+                    Vec::new(),
+                    None,
+                    HashMap::default(),
+                    Some(format!("setup failed: {err}")),
+                    None,
+                ),
             };
             traces.extend(setup_traces.map(|traces| (TraceKind::Setup, traces)));
             logs.extend(setup_logs);
@@ -210,7 +214,7 @@ impl<'a> ContractRunner<'a> {
     /// returns an array of addresses to be used for fuzzing `owner` named parameter in scope of the
     /// current test.
     fn fuzz_fixtures(&mut self, address: Address) -> FuzzFixtures {
-        let mut fixtures = HashMap::new();
+        let mut fixtures = HashMap::default();
         let fixture_functions = self.contract.abi.functions().filter(|func| func.is_fixture());
         for func in fixture_functions {
             if func.inputs.is_empty() {
@@ -443,7 +447,7 @@ impl<'a> ContractRunner<'a> {
         ) {
             Ok(res) => (res.raw, None),
             Err(EvmError::Execution(err)) => (err.raw, Some(err.reason)),
-            Err(EvmError::SkipError) => return test_result.single_skip(),
+            Err(EvmError::Skip(reason)) => return test_result.single_skip(reason),
             Err(err) => return test_result.single_fail(Some(err.to_string())),
         };
 
@@ -467,7 +471,7 @@ impl<'a> ContractRunner<'a> {
         let mut test_result = TestResult::new(setup);
 
         // First, run the test normally to see if it needs to be skipped.
-        if let Err(EvmError::SkipError) = self.executor.call(
+        if let Err(EvmError::Skip(reason)) = self.executor.call(
             self.sender,
             address,
             func,
@@ -475,7 +479,7 @@ impl<'a> ContractRunner<'a> {
             U256::ZERO,
             Some(self.revert_decoder),
         ) {
-            return test_result.invariant_skip()
+            return test_result.invariant_skip(reason);
         };
 
         let mut evm = InvariantExecutor::new(
@@ -530,6 +534,7 @@ impl<'a> ContractRunner<'a> {
                         &mut test_result.logs,
                         &mut test_result.traces,
                         &mut test_result.coverage,
+                        &mut test_result.deprecated_cheatcodes,
                         &txes,
                     );
                     return test_result.invariant_replay_fail(
@@ -572,6 +577,7 @@ impl<'a> ContractRunner<'a> {
                         &mut test_result.logs,
                         &mut test_result.traces,
                         &mut test_result.coverage,
+                        &mut test_result.deprecated_cheatcodes,
                         progress.as_ref(),
                     ) {
                         Ok(call_sequence) => {
@@ -607,6 +613,7 @@ impl<'a> ContractRunner<'a> {
                     &mut test_result.logs,
                     &mut test_result.traces,
                     &mut test_result.coverage,
+                    &mut test_result.deprecated_cheatcodes,
                     &invariant_result.last_run_inputs,
                 ) {
                     error!(%err, "Failed to replay last invariant run");
@@ -661,12 +668,6 @@ impl<'a> ContractRunner<'a> {
             self.revert_decoder,
             progress.as_ref(),
         );
-
-        // Check the last test result and skip the test
-        // if it's marked as so.
-        if let Some("SKIPPED") = result.reason.as_deref() {
-            return test_result.single_skip()
-        }
         test_result.fuzz_result(result)
     }
 

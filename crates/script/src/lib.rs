@@ -11,7 +11,11 @@ extern crate tracing;
 use self::transaction::AdditionalContract;
 use crate::runner::ScriptRunner;
 use alloy_json_abi::{Function, JsonAbi};
-use alloy_primitives::{hex, Address, Bytes, Log, TxKind, U256};
+use alloy_primitives::{
+    hex,
+    map::{AddressHashMap, HashMap},
+    Address, Bytes, Log, TxKind, U256,
+};
 use alloy_signer::Signer;
 use broadcast::next_nonce;
 use build::PreprocessedState;
@@ -47,7 +51,6 @@ use foundry_evm::{
 };
 use foundry_wallets::MultiWalletOpts;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use yansi::Paint;
 
 mod broadcast;
@@ -276,7 +279,7 @@ impl ScriptArgs {
         };
 
         // Exit early in case user didn't provide any broadcast/verify related flags.
-        if !bundled.args.broadcast && !bundled.args.resume && !bundled.args.verify {
+        if !bundled.args.should_broadcast() {
             shell::println("\nSIMULATION COMPLETE. To broadcast these transactions, add --broadcast and wallet configuration(s) to the previous command. See forge script --help for more.")?;
             return Ok(());
         }
@@ -419,7 +422,7 @@ impl ScriptArgs {
                 let deployment_size = deployed_code.len();
 
                 if deployment_size > max_size {
-                    prompt_user = self.broadcast;
+                    prompt_user = self.should_broadcast();
                     shell::println(format!(
                         "{}",
                         format!(
@@ -439,6 +442,11 @@ impl ScriptArgs {
         }
 
         Ok(())
+    }
+
+    /// We only broadcast transactions if --broadcast or --resume was passed.
+    fn should_broadcast(&self) -> bool {
+        self.broadcast || self.resume
     }
 }
 
@@ -471,7 +479,7 @@ pub struct ScriptResult {
     pub logs: Vec<Log>,
     pub traces: Traces,
     pub gas_used: u64,
-    pub labeled_addresses: HashMap<Address, String>,
+    pub labeled_addresses: AddressHashMap<String>,
     #[serde(skip)]
     pub transactions: Option<BroadcastableTransactions>,
     pub returned: Bytes,
@@ -531,7 +539,7 @@ impl ScriptConfig {
             // dapptools compatibility
             1
         };
-        Ok(Self { config, evm_opts, sender_nonce, backends: HashMap::new() })
+        Ok(Self { config, evm_opts, sender_nonce, backends: HashMap::default() })
     }
 
     pub async fn update_sender(&mut self, sender: Address) -> Result<()> {
@@ -604,6 +612,7 @@ impl ScriptConfig {
                             self.evm_opts.clone(),
                             Some(known_contracts),
                             Some(script_wallets),
+                            Some(target.name),
                             Some(target.version),
                         )
                         .into(),

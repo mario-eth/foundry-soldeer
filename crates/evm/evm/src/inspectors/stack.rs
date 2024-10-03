@@ -2,7 +2,7 @@ use super::{
     Cheatcodes, CheatsConfig, ChiselState, CoverageCollector, Fuzzer, LogCollector,
     TracingInspector,
 };
-use alloy_primitives::{Address, Bytes, Log, TxKind, U256};
+use alloy_primitives::{map::AddressHashMap, Address, Bytes, Log, TxKind, U256};
 use foundry_cheatcodes::CheatcodesExecutor;
 use foundry_evm_core::{
     backend::{update_state, DatabaseExt},
@@ -22,7 +22,6 @@ use revm::{
     EvmContext, Inspector,
 };
 use std::{
-    collections::HashMap,
     ops::{Deref, DerefMut},
     sync::Arc,
 };
@@ -243,7 +242,7 @@ macro_rules! call_inspectors_adjust_depth {
 /// The collected results of [`InspectorStack`].
 pub struct InspectorData {
     pub logs: Vec<Log>,
-    pub labels: HashMap<Address, String>,
+    pub labels: AddressHashMap<String>,
     pub traces: Option<SparsedTraceArena>,
     pub coverage: Option<HitMaps>,
     pub cheatcodes: Option<Cheatcodes>,
@@ -257,15 +256,8 @@ pub struct InspectorData {
 /// non-isolated mode. For descriptions and workarounds for those changes see: <https://github.com/foundry-rs/foundry/pull/7186#issuecomment-1959102195>
 #[derive(Debug, Clone)]
 pub struct InnerContextData {
-    /// The sender of the inner EVM context.
-    /// It is also an origin of the transaction that created the inner EVM context.
-    sender: Address,
-    /// Nonce of the sender before invocation of the inner EVM context.
-    original_sender_nonce: u64,
     /// Origin of the transaction in the outer EVM context.
     original_origin: Address,
-    /// Whether the inner context was created by a CREATE transaction.
-    is_create: bool,
 }
 
 /// An inspector that calls multiple inspectors in sequence.
@@ -312,11 +304,8 @@ pub struct InspectorStackRefMut<'a> {
 }
 
 impl CheatcodesExecutor for InspectorStackInner {
-    fn get_inspector<'a, DB: DatabaseExt>(
-        &'a mut self,
-        cheats: &'a mut Cheatcodes,
-    ) -> impl InspectorExt<DB> + 'a {
-        InspectorStackRefMut { cheatcodes: Some(cheats), inner: self }
+    fn get_inspector<'a>(&'a mut self, cheats: &'a mut Cheatcodes) -> Box<dyn InspectorExt + 'a> {
+        Box::new(InspectorStackRefMut { cheatcodes: Some(cheats), inner: self })
     }
 
     fn tracing_inspector(&mut self) -> Option<&mut Option<TracingInspector>> {
@@ -487,23 +476,15 @@ impl<'a> InspectorStackRefMut<'a> {
     /// Should be called on the top-level call of inner context (depth == 0 &&
     /// self.in_inner_context) Decreases sender nonce for CALLs to keep backwards compatibility
     /// Updates tx.origin to the value before entering inner context
-    fn adjust_evm_data_for_inner_context<DB: DatabaseExt>(&mut self, ecx: &mut EvmContext<DB>) {
+    fn adjust_evm_data_for_inner_context(&mut self, ecx: &mut EvmContext<&mut dyn DatabaseExt>) {
         let inner_context_data =
             self.inner_context_data.as_ref().expect("should be called in inner context");
-        let sender_acc = ecx
-            .journaled_state
-            .state
-            .get_mut(&inner_context_data.sender)
-            .expect("failed to load sender");
-        if !inner_context_data.is_create {
-            sender_acc.info.nonce = inner_context_data.original_sender_nonce;
-        }
         ecx.env.tx.caller = inner_context_data.original_origin;
     }
 
-    fn do_call_end<DB: DatabaseExt>(
+    fn do_call_end(
         &mut self,
-        ecx: &mut EvmContext<DB>,
+        ecx: &mut EvmContext<&mut dyn DatabaseExt>,
         inputs: &CallInputs,
         outcome: CallOutcome,
     ) -> CallOutcome {
@@ -528,9 +509,9 @@ impl<'a> InspectorStackRefMut<'a> {
         outcome
     }
 
-    fn transact_inner<DB: DatabaseExt>(
+    fn transact_inner(
         &mut self,
-        ecx: &mut EvmContext<DB>,
+        ecx: &mut EvmContext<&mut dyn DatabaseExt>,
         transact_to: TransactTo,
         caller: Address,
         input: Bytes,
@@ -541,13 +522,6 @@ impl<'a> InspectorStackRefMut<'a> {
 
         ecx.db.commit(ecx.journaled_state.state.clone());
 
-        let nonce = ecx
-            .journaled_state
-            .load_account(caller, &mut ecx.db)
-            .expect("failed to load caller")
-            .info
-            .nonce;
-
         let cached_env = ecx.env.clone();
 
         ecx.env.block.basefee = U256::ZERO;
@@ -555,7 +529,6 @@ impl<'a> InspectorStackRefMut<'a> {
         ecx.env.tx.transact_to = transact_to;
         ecx.env.tx.data = input;
         ecx.env.tx.value = value;
-        ecx.env.tx.nonce = Some(nonce);
         // Add 21000 to the gas limit to account for the base cost of transaction.
         ecx.env.tx.gas_limit = gas_limit + 21000;
         // If we haven't disabled gas limit checks, ensure that transaction gas limit will not
@@ -566,21 +539,12 @@ impl<'a> InspectorStackRefMut<'a> {
         }
         ecx.env.tx.gas_price = U256::ZERO;
 
-        self.inner_context_data = Some(InnerContextData {
-            sender: ecx.env.tx.caller,
-            original_origin: cached_env.tx.caller,
-            original_sender_nonce: nonce,
-            is_create: matches!(transact_to, TxKind::Create),
-        });
+        self.inner_context_data = Some(InnerContextData { original_origin: cached_env.tx.caller });
         self.in_inner_context = true;
 
         let env = EnvWithHandlerCfg::new_with_spec_id(ecx.env.clone(), ecx.spec_id());
         let res = {
-            let mut evm = crate::utils::new_evm_with_inspector(
-                &mut ecx.db as &mut dyn DatabaseExt,
-                env,
-                &mut *self,
-            );
+            let mut evm = crate::utils::new_evm_with_inspector(&mut ecx.db, env, self);
             let res = evm.transact();
 
             // need to reset the env in case it was modified via cheatcodes during execution
@@ -659,8 +623,12 @@ impl<'a> InspectorStackRefMut<'a> {
     }
 }
 
-impl<'a, DB: DatabaseExt> Inspector<DB> for InspectorStackRefMut<'a> {
-    fn initialize_interp(&mut self, interpreter: &mut Interpreter, ecx: &mut EvmContext<DB>) {
+impl<'a> Inspector<&mut dyn DatabaseExt> for InspectorStackRefMut<'a> {
+    fn initialize_interp(
+        &mut self,
+        interpreter: &mut Interpreter,
+        ecx: &mut EvmContext<&mut dyn DatabaseExt>,
+    ) {
         call_inspectors_adjust_depth!(
             [&mut self.coverage, &mut self.tracer, &mut self.cheatcodes, &mut self.printer],
             |inspector| inspector.initialize_interp(interpreter, ecx),
@@ -669,7 +637,7 @@ impl<'a, DB: DatabaseExt> Inspector<DB> for InspectorStackRefMut<'a> {
         );
     }
 
-    fn step(&mut self, interpreter: &mut Interpreter, ecx: &mut EvmContext<DB>) {
+    fn step(&mut self, interpreter: &mut Interpreter, ecx: &mut EvmContext<&mut dyn DatabaseExt>) {
         call_inspectors_adjust_depth!(
             [
                 &mut self.fuzzer,
@@ -684,7 +652,11 @@ impl<'a, DB: DatabaseExt> Inspector<DB> for InspectorStackRefMut<'a> {
         );
     }
 
-    fn step_end(&mut self, interpreter: &mut Interpreter, ecx: &mut EvmContext<DB>) {
+    fn step_end(
+        &mut self,
+        interpreter: &mut Interpreter,
+        ecx: &mut EvmContext<&mut dyn DatabaseExt>,
+    ) {
         call_inspectors_adjust_depth!(
             [&mut self.tracer, &mut self.cheatcodes, &mut self.chisel_state, &mut self.printer],
             |inspector| inspector.step_end(interpreter, ecx),
@@ -693,7 +665,12 @@ impl<'a, DB: DatabaseExt> Inspector<DB> for InspectorStackRefMut<'a> {
         );
     }
 
-    fn log(&mut self, interpreter: &mut Interpreter, ecx: &mut EvmContext<DB>, log: &Log) {
+    fn log(
+        &mut self,
+        interpreter: &mut Interpreter,
+        ecx: &mut EvmContext<&mut dyn DatabaseExt>,
+        log: &Log,
+    ) {
         call_inspectors_adjust_depth!(
             [&mut self.tracer, &mut self.log_collector, &mut self.cheatcodes, &mut self.printer],
             |inspector| inspector.log(interpreter, ecx, log),
@@ -702,7 +679,11 @@ impl<'a, DB: DatabaseExt> Inspector<DB> for InspectorStackRefMut<'a> {
         );
     }
 
-    fn call(&mut self, ecx: &mut EvmContext<DB>, call: &mut CallInputs) -> Option<CallOutcome> {
+    fn call(
+        &mut self,
+        ecx: &mut EvmContext<&mut dyn DatabaseExt>,
+        call: &mut CallInputs,
+    ) -> Option<CallOutcome> {
         if self.in_inner_context && ecx.journaled_state.depth == 0 {
             self.adjust_evm_data_for_inner_context(ecx);
             return None;
@@ -726,6 +707,18 @@ impl<'a, DB: DatabaseExt> Inspector<DB> for InspectorStackRefMut<'a> {
 
         ecx.journaled_state.depth += self.in_inner_context as usize;
         if let Some(cheatcodes) = self.cheatcodes.as_deref_mut() {
+            // Handle mocked functions, replace bytecode address with mock if matched.
+            if let Some(mocks) = cheatcodes.mocked_functions.get(&call.target_address) {
+                // Check if any mock function set for call data or if catch-all mock function set
+                // for selector.
+                if let Some(target) = mocks
+                    .get(&call.input)
+                    .or_else(|| call.input.get(..4).and_then(|selector| mocks.get(selector)))
+                {
+                    call.bytecode_address = *target;
+                }
+            }
+
             if let Some(output) = cheatcodes.call_with_executor(ecx, call, self.inner) {
                 if output.result.result != InstructionResult::Continue {
                     ecx.journaled_state.depth -= self.in_inner_context as usize;
@@ -756,7 +749,7 @@ impl<'a, DB: DatabaseExt> Inspector<DB> for InspectorStackRefMut<'a> {
 
     fn call_end(
         &mut self,
-        ecx: &mut EvmContext<DB>,
+        ecx: &mut EvmContext<&mut dyn DatabaseExt>,
         inputs: &CallInputs,
         outcome: CallOutcome,
     ) -> CallOutcome {
@@ -781,7 +774,7 @@ impl<'a, DB: DatabaseExt> Inspector<DB> for InspectorStackRefMut<'a> {
 
     fn create(
         &mut self,
-        ecx: &mut EvmContext<DB>,
+        ecx: &mut EvmContext<&mut dyn DatabaseExt>,
         create: &mut CreateInputs,
     ) -> Option<CreateOutcome> {
         if self.in_inner_context && ecx.journaled_state.depth == 0 {
@@ -818,7 +811,7 @@ impl<'a, DB: DatabaseExt> Inspector<DB> for InspectorStackRefMut<'a> {
 
     fn create_end(
         &mut self,
-        ecx: &mut EvmContext<DB>,
+        ecx: &mut EvmContext<&mut dyn DatabaseExt>,
         call: &CreateInputs,
         outcome: CreateOutcome,
     ) -> CreateOutcome {
@@ -852,7 +845,7 @@ impl<'a, DB: DatabaseExt> Inspector<DB> for InspectorStackRefMut<'a> {
 
     fn eofcreate(
         &mut self,
-        ecx: &mut EvmContext<DB>,
+        ecx: &mut EvmContext<&mut dyn DatabaseExt>,
         create: &mut EOFCreateInputs,
     ) -> Option<CreateOutcome> {
         if self.in_inner_context && ecx.journaled_state.depth == 0 {
@@ -894,7 +887,7 @@ impl<'a, DB: DatabaseExt> Inspector<DB> for InspectorStackRefMut<'a> {
 
     fn eofcreate_end(
         &mut self,
-        ecx: &mut EvmContext<DB>,
+        ecx: &mut EvmContext<&mut dyn DatabaseExt>,
         call: &EOFCreateInputs,
         outcome: CreateOutcome,
     ) -> CreateOutcome {
@@ -928,15 +921,15 @@ impl<'a, DB: DatabaseExt> Inspector<DB> for InspectorStackRefMut<'a> {
 
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
         call_inspectors!([&mut self.tracer, &mut self.printer], |inspector| {
-            Inspector::<DB>::selfdestruct(inspector, contract, target, value)
+            Inspector::<&mut dyn DatabaseExt>::selfdestruct(inspector, contract, target, value)
         });
     }
 }
 
-impl<'a, DB: DatabaseExt> InspectorExt<DB> for InspectorStackRefMut<'a> {
+impl InspectorExt for InspectorStackRefMut<'_> {
     fn should_use_create2_factory(
         &mut self,
-        ecx: &mut EvmContext<DB>,
+        ecx: &mut EvmContext<&mut dyn DatabaseExt>,
         inputs: &mut CreateInputs,
     ) -> bool {
         call_inspectors_adjust_depth!(
@@ -951,7 +944,7 @@ impl<'a, DB: DatabaseExt> InspectorExt<DB> for InspectorStackRefMut<'a> {
     }
 
     fn console_log(&mut self, input: String) {
-        call_inspectors!([&mut self.log_collector], |inspector| InspectorExt::<DB>::console_log(
+        call_inspectors!([&mut self.log_collector], |inspector| InspectorExt::console_log(
             inspector, input
         ));
     }
@@ -961,20 +954,24 @@ impl<'a, DB: DatabaseExt> InspectorExt<DB> for InspectorStackRefMut<'a> {
     }
 }
 
-impl<DB: DatabaseExt> Inspector<DB> for InspectorStack {
+impl Inspector<&mut dyn DatabaseExt> for InspectorStack {
     #[inline]
-    fn step(&mut self, interpreter: &mut Interpreter, ecx: &mut EvmContext<DB>) {
+    fn step(&mut self, interpreter: &mut Interpreter, ecx: &mut EvmContext<&mut dyn DatabaseExt>) {
         self.as_mut().step(interpreter, ecx)
     }
 
     #[inline]
-    fn step_end(&mut self, interpreter: &mut Interpreter, ecx: &mut EvmContext<DB>) {
+    fn step_end(
+        &mut self,
+        interpreter: &mut Interpreter,
+        ecx: &mut EvmContext<&mut dyn DatabaseExt>,
+    ) {
         self.as_mut().step_end(interpreter, ecx)
     }
 
     fn call(
         &mut self,
-        context: &mut EvmContext<DB>,
+        context: &mut EvmContext<&mut dyn DatabaseExt>,
         inputs: &mut CallInputs,
     ) -> Option<CallOutcome> {
         self.as_mut().call(context, inputs)
@@ -982,7 +979,7 @@ impl<DB: DatabaseExt> Inspector<DB> for InspectorStack {
 
     fn call_end(
         &mut self,
-        context: &mut EvmContext<DB>,
+        context: &mut EvmContext<&mut dyn DatabaseExt>,
         inputs: &CallInputs,
         outcome: CallOutcome,
     ) -> CallOutcome {
@@ -991,7 +988,7 @@ impl<DB: DatabaseExt> Inspector<DB> for InspectorStack {
 
     fn create(
         &mut self,
-        context: &mut EvmContext<DB>,
+        context: &mut EvmContext<&mut dyn DatabaseExt>,
         create: &mut CreateInputs,
     ) -> Option<CreateOutcome> {
         self.as_mut().create(context, create)
@@ -999,7 +996,7 @@ impl<DB: DatabaseExt> Inspector<DB> for InspectorStack {
 
     fn create_end(
         &mut self,
-        context: &mut EvmContext<DB>,
+        context: &mut EvmContext<&mut dyn DatabaseExt>,
         call: &CreateInputs,
         outcome: CreateOutcome,
     ) -> CreateOutcome {
@@ -1008,7 +1005,7 @@ impl<DB: DatabaseExt> Inspector<DB> for InspectorStack {
 
     fn eofcreate(
         &mut self,
-        context: &mut EvmContext<DB>,
+        context: &mut EvmContext<&mut dyn DatabaseExt>,
         create: &mut EOFCreateInputs,
     ) -> Option<CreateOutcome> {
         self.as_mut().eofcreate(context, create)
@@ -1016,30 +1013,39 @@ impl<DB: DatabaseExt> Inspector<DB> for InspectorStack {
 
     fn eofcreate_end(
         &mut self,
-        context: &mut EvmContext<DB>,
+        context: &mut EvmContext<&mut dyn DatabaseExt>,
         call: &EOFCreateInputs,
         outcome: CreateOutcome,
     ) -> CreateOutcome {
         self.as_mut().eofcreate_end(context, call, outcome)
     }
 
-    fn initialize_interp(&mut self, interpreter: &mut Interpreter, ecx: &mut EvmContext<DB>) {
+    fn initialize_interp(
+        &mut self,
+        interpreter: &mut Interpreter,
+        ecx: &mut EvmContext<&mut dyn DatabaseExt>,
+    ) {
         self.as_mut().initialize_interp(interpreter, ecx)
     }
 
-    fn log(&mut self, interpreter: &mut Interpreter, ecx: &mut EvmContext<DB>, log: &Log) {
+    fn log(
+        &mut self,
+        interpreter: &mut Interpreter,
+        ecx: &mut EvmContext<&mut dyn DatabaseExt>,
+        log: &Log,
+    ) {
         self.as_mut().log(interpreter, ecx, log)
     }
 
     fn selfdestruct(&mut self, contract: Address, target: Address, value: U256) {
-        Inspector::<DB>::selfdestruct(&mut self.as_mut(), contract, target, value)
+        Inspector::<&mut dyn DatabaseExt>::selfdestruct(&mut self.as_mut(), contract, target, value)
     }
 }
 
-impl<DB: DatabaseExt> InspectorExt<DB> for InspectorStack {
+impl InspectorExt for InspectorStack {
     fn should_use_create2_factory(
         &mut self,
-        ecx: &mut EvmContext<DB>,
+        ecx: &mut EvmContext<&mut dyn DatabaseExt>,
         inputs: &mut CreateInputs,
     ) -> bool {
         self.as_mut().should_use_create2_factory(ecx, inputs)

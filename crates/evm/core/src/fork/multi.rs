@@ -4,7 +4,8 @@
 //! concurrently active pairs at once.
 
 use super::CreateFork;
-use alloy_primitives::U256;
+use alloy_primitives::{map::HashMap, U256};
+use alloy_provider::network::{BlockResponse, HeaderResponse};
 use alloy_transport::layers::RetryBackoffService;
 use foundry_common::provider::{
     runtime_transport::RuntimeTransport, ProviderBuilder, RetryProvider,
@@ -19,7 +20,6 @@ use futures::{
 };
 use revm::primitives::Env;
 use std::{
-    collections::HashMap,
     fmt::{self, Write},
     pin::Pin,
     sync::{
@@ -524,7 +524,7 @@ async fn create_fork(mut fork: CreateFork) -> eyre::Result<(ForkId, CreatedFork,
 
     // We need to use the block number from the block because the env's number can be different on
     // some L2s (e.g. Arbitrum).
-    let number = block.header.number.unwrap_or(meta.block_env.number.to());
+    let number = block.header().number();
 
     // Determine the cache path if caching is enabled.
     let cache_path = if fork.enable_caching {
