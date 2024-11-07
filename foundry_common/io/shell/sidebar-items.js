@@ -1,0 +1,1 @@
+window.SIDEBAR_ITEMS = {"enum":["ColorChoice","OutputFormat","ShellOut","TtyWidth","Verbosity"],"fn":["is_json","is_quiet","supports_color","verbosity"],"static":["GLOBAL_SHELL"],"struct":["Shell"]};
